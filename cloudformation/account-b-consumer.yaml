@@ -1,0 +1,201 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Account B cross-account Kinesis consumer, Lambda, and Glue job.
+
+Parameters:
+  BootstrapOnly:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: Keep true for the first deployment; set false after Account A policies exist.
+  SourceStreamArn:
+    Type: String
+    Default: arn:aws:kinesis:ap-south-1:111111111111:stream/source-stream
+  SourceKmsKeyArn:
+    Type: String
+    Default: arn:aws:kms:ap-south-1:111111111111:key/REPLACE_WITH_ACCOUNT_A_KEY_ID
+  SourceDataBucketName:
+    Type: String
+    Default: source-data-bucket
+    Description: Account A bucket read by the Glue role; set empty to omit its Glue policy statement.
+  GlueArtifactsBucketName:
+    Type: String
+    Default: consumer-artifacts-ap-south-1
+    Description: Account B bucket holding the Lambda ZIP and Glue ETL script.
+  SourceDataKmsKeyArn:
+    Type: String
+    Default: ''
+    Description: Optional Account A customer-managed key ARN if source S3 objects use SSE-KMS.
+  LambdaArtifactBucket:
+    Type: String
+    Default: consumer-artifacts-ap-south-1
+    Description: Account B S3 bucket containing the zipped lambda/index.py artifact.
+  LambdaArtifactKey:
+    Type: String
+    Default: lambda/kinesis-consumer.zip
+  GlueScriptLocation:
+    Type: String
+    Default: s3://consumer-artifacts-ap-south-1/glue/consumer.py
+    Description: S3 URI for the Glue ETL script, accessible to the Glue execution role.
+  GlueJobName:
+    Type: String
+    Default: consumer-glue-job
+
+Conditions:
+  DeployConsumer: !Equals [!Ref BootstrapOnly, 'false']
+  HasSourceDataBucket: !Not [!Equals [!Ref SourceDataBucketName, '']]
+  HasSourceDataKmsKey: !Not [!Equals [!Ref SourceDataKmsKeyArn, '']]
+
+Resources:
+  KinesisConsumerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: KinesisConsumerLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: KinesisGlueConsumerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: LambdaLogging
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Sid: ReadAccountAKinesisStream
+                Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:ListShards
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                Resource: !Ref SourceStreamArn
+              - Sid: DecryptAccountAKinesisStream
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Resource: !Ref SourceKmsKeyArn
+              - Sid: StartConsumerGlueJob
+                Effect: Allow
+                Action: glue:StartJobRun
+                Resource: !Sub arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/${GlueJobName}
+
+  ConsumerGlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ConsumerGlueJobRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: ReadAccountASourceObjects
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - !If
+                - HasSourceDataBucket
+                - Sid: ListAccountASourceBucket
+                  Effect: Allow
+                  Action: s3:ListBucket
+                  Resource: !Sub arn:${AWS::Partition}:s3:::${SourceDataBucketName}
+                - !Ref AWS::NoValue
+              - !If
+                - HasSourceDataBucket
+                - Sid: ReadAccountASourceObjects
+                  Effect: Allow
+                  Action: s3:GetObject
+                  Resource: !Sub arn:${AWS::Partition}:s3:::${SourceDataBucketName}/*
+                - !Ref AWS::NoValue
+              - !If
+                - HasSourceDataKmsKey
+                - Sid: DecryptAccountASourceObjects
+                  Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                    - kms:DescribeKey
+                  Resource: !Ref SourceDataKmsKeyArn
+                - !Ref AWS::NoValue
+              - Sid: ReadGlueScriptArtifact
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${GlueArtifactsBucketName}
+                  - !Sub arn:${AWS::Partition}:s3:::${GlueArtifactsBucketName}/*
+
+  KinesisConsumerLambda:
+    Type: AWS::Lambda::Function
+    Condition: DeployConsumer
+    Properties:
+      FunctionName: KinesisConsumerLambda
+      Description: Reads Account A Kinesis records and starts the Account B Glue job.
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt KinesisConsumerLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref LambdaArtifactBucket
+        S3Key: !Ref LambdaArtifactKey
+      Environment:
+        Variables:
+          GLUE_JOB_NAME: !Ref GlueJobName
+
+  ConsumerGlueJob:
+    Type: AWS::Glue::Job
+    Condition: DeployConsumer
+    Properties:
+      Name: !Ref GlueJobName
+      Role: !GetAtt ConsumerGlueJobRole.Arn
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Ref GlueScriptLocation
+      GlueVersion: '4.0'
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      ExecutionProperty:
+        MaxConcurrentRuns: 10
+      Timeout: 60
+      MaxRetries: 1
+
+  KinesisConsumerEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: DeployConsumer
+    Properties:
+      FunctionName: !Ref KinesisConsumerLambda
+      EventSourceArn: !Ref SourceStreamArn
+      StartingPosition: LATEST
+      BatchSize: 100
+      MaximumBatchingWindowInSeconds: 10
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+      Enabled: true
+
+Outputs:
+  KinesisConsumerLambdaRoleArn:
+    Value: !GetAtt KinesisConsumerLambdaRole.Arn
+  ConsumerGlueJobRoleArn:
+    Value: !GetAtt ConsumerGlueJobRole.Arn
+  ConsumerLambdaArn:
+    Condition: DeployConsumer
+    Value: !GetAtt KinesisConsumerLambda.Arn
+  ConsumerGlueJobName:
+    Condition: DeployConsumer
+    Value: !Ref ConsumerGlueJob

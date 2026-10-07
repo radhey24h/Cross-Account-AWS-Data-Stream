@@ -1,0 +1,98 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Account A resources and cross-account policies for the source Kinesis stream.
+
+Parameters:
+  ConsumerLambdaRoleArn:
+    Type: String
+    Default: arn:aws:iam::222222222222:role/KinesisConsumerLambdaRole
+    Description: Account B Lambda execution role; create this role before deploying this stack.
+  SourceDataBucketName:
+    Type: String
+    Default: ''
+    Description: Optional existing Account A bucket to allow Account B Glue reads.
+
+Conditions:
+  ConfigureSourceBucketPolicy: !Not [!Equals [!Ref SourceDataBucketName, '']]
+
+Resources:
+  SourceKinesisKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Customer-managed KMS key for source-stream encryption.
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableAccountABackupAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowAccountBLambdaToDecryptStream
+            Effect: Allow
+            Principal:
+              AWS: !Ref ConsumerLambdaRoleArn
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+            Resource: '*'
+
+  SourceStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: source-stream
+      RetentionPeriodHours: 168
+      StreamModeDetails:
+        StreamMode: ON_DEMAND
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: !GetAtt SourceKinesisKey.Arn
+
+  SourceStreamResourcePolicy:
+    Type: AWS::Kinesis::ResourcePolicy
+    Properties:
+      ResourceArn: !GetAtt SourceStream.Arn
+      ResourcePolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowAccountBLambdaRead
+            Effect: Allow
+            Principal:
+              AWS: !Ref ConsumerLambdaRoleArn
+            Action:
+              - kinesis:DescribeStream
+              - kinesis:DescribeStreamSummary
+              - kinesis:ListShards
+              - kinesis:GetShardIterator
+              - kinesis:GetRecords
+            Resource: !GetAtt SourceStream.Arn
+
+  SourceDataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: ConfigureSourceBucketPolicy
+    Properties:
+      Bucket: !Ref SourceDataBucketName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowAccountBGlueReadObjects
+            Effect: Allow
+            Principal:
+              AWS: arn:aws:iam::222222222222:role/ConsumerGlueJobRole
+            Action: s3:GetObject
+            Resource: !Sub arn:${AWS::Partition}:s3:::${SourceDataBucketName}/*
+          - Sid: AllowAccountBGlueListBucket
+            Effect: Allow
+            Principal:
+              AWS: arn:aws:iam::222222222222:role/ConsumerGlueJobRole
+            Action: s3:ListBucket
+            Resource: !Sub arn:${AWS::Partition}:s3:::${SourceDataBucketName}
+
+Outputs:
+  SourceStreamArn:
+    Description: Cross-account source stream ARN.
+    Value: !GetAtt SourceStream.Arn
+  SourceKmsKeyArn:
+    Description: Customer-managed stream encryption key ARN.
+    Value: !GetAtt SourceKinesisKey.Arn
